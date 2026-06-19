@@ -1,0 +1,159 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Source repository ref to build
+        required: true
+        default: main
+        type: string
+      prerelease:
+        description: Mark the GitHub release as prerelease
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      SOURCE_REPOSITORY: PengDingkang/BiliHDMultiPageFix
+      RELEASE_KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
+      RELEASE_STORE_FILE: ${{ github.workspace }}/source/release.jks
+      RELEASE_STORE_PASSWORD: ${{ secrets.RELEASE_STORE_PASSWORD }}
+      RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+      RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
+
+    steps:
+      - name: Checkout module repository
+        uses: actions/checkout@v6
+        with:
+          path: module
+          fetch-depth: 0
+
+      - name: Checkout source repository
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.SOURCE_REPOSITORY }}
+          ref: ${{ inputs.source_ref }}
+          path: source
+          fetch-depth: 0
+
+      - name: Set up JDK
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          build-root-directory: source
+
+      - name: Read release version
+        run: |
+          VERSION_NAME="$(sed -n 's/^appVersionName=//p' source/gradle.properties)"
+          VERSION_CODE="$(sed -n 's/^appVersionCode=//p' source/gradle.properties)"
+          test -n "$VERSION_NAME"
+          test -n "$VERSION_CODE"
+
+          if printf '%s' "$VERSION_NAME" | grep -q '[[:space:]]'; then
+            echo "appVersionName must not contain whitespace for LSPosed release tags"
+            exit 1
+          fi
+
+          TAG_NAME="${VERSION_CODE}-${VERSION_NAME}"
+          git -C module fetch --tags --force
+          if git -C module rev-parse "refs/tags/$TAG_NAME" >/dev/null 2>&1; then
+            echo "Release tag $TAG_NAME already exists"
+            exit 1
+          fi
+
+          echo "VERSION_NAME=$VERSION_NAME" >> "$GITHUB_ENV"
+          echo "VERSION_CODE=$VERSION_CODE" >> "$GITHUB_ENV"
+          echo "TAG_NAME=$TAG_NAME" >> "$GITHUB_ENV"
+          echo "SOURCE_SHA=$(git -C source rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Check release signing secrets
+        run: |
+          test -n "$RELEASE_KEYSTORE_BASE64"
+          test -n "$RELEASE_STORE_PASSWORD"
+          test -n "$RELEASE_KEY_ALIAS"
+          test -n "$RELEASE_KEY_PASSWORD"
+
+      - name: Restore release keystore
+        run: echo "$RELEASE_KEYSTORE_BASE64" | base64 --decode > "$RELEASE_STORE_FILE"
+
+      - name: Build release APKs from source
+        working-directory: source
+        run: |
+          ./gradlew :app:assembleLegacyRelease :app:assembleModernApi102Release --no-daemon -PuseFlavorVersionNameSuffix=false
+
+      - name: Prepare release artifacts
+        run: |
+          mkdir -p dist
+          cp source/app/build/outputs/apk/legacy/release/app-legacy-release.apk "dist/BiliHDPager-${VERSION_NAME}-legacy.apk"
+          cp source/app/build/outputs/apk/modernApi102/release/app-modernApi102-release.apk "dist/BiliHDPager-${VERSION_NAME}-modern-api102.apk"
+
+      - name: Verify APK metadata and signatures
+        run: |
+          AAPT="$(find "$ANDROID_HOME/build-tools" -name aapt2 | sort -V | tail -n 1)"
+          APKSIGNER="$(find "$ANDROID_HOME/build-tools" -name apksigner | sort -V | tail -n 1)"
+          test -x "$AAPT"
+          test -x "$APKSIGNER"
+
+          for apk in dist/*.apk; do
+            echo "Checking $apk"
+            BADGING="$("$AAPT" dump badging "$apk" | head -n 1)"
+            echo "$BADGING"
+            echo "$BADGING" | grep "name='org.hdhmc.bilihdpager'"
+            echo "$BADGING" | grep "versionCode='$VERSION_CODE'"
+            echo "$BADGING" | grep "versionName='$VERSION_NAME'"
+            "$APKSIGNER" verify --print-certs "$apk"
+          done
+
+      - name: Generate release notes
+        run: |
+          awk -v version="$VERSION_NAME" '
+            $0 ~ "^## \\[" version "\\]" { found = 1; next }
+            found && /^## \[/ { exit }
+            found { print }
+            END { if (!found) exit 1 }
+          ' source/CHANGELOG.md > source_release_notes.md
+          test -s source_release_notes.md
+
+          {
+            echo "### APK 选择"
+            echo
+            echo "- \`BiliHDPager-${VERSION_NAME}-modern-api102.apk\`: 推荐用于 LSPosed v2.1.0(7769) 及以上。"
+            echo "- \`BiliHDPager-${VERSION_NAME}-legacy.apk\`: 用于旧版 LSPosed 环境。"
+            echo
+            echo "### 更新内容"
+            cat source_release_notes.md
+            echo
+            echo "Source: https://github.com/${SOURCE_REPOSITORY}/commit/${SOURCE_SHA}"
+          } > release_notes.md
+
+      - name: Upload release APKs
+        uses: actions/upload-artifact@v7
+        with:
+          name: BiliHDPager-${{ env.VERSION_NAME }}-release
+          path: dist/*.apk
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG_NAME }}
+          target_commitish: ${{ github.ref_name }}
+          name: ${{ env.VERSION_NAME }}
+          body_path: release_notes.md
+          prerelease: ${{ inputs.prerelease }}
+          fail_on_unmatched_files: true
+          files: dist/*.apk
